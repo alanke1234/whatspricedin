@@ -233,7 +233,6 @@ REFRESH_NOTE = "Intraday mode compares last price to prior close (today only). U
 
 EQUITY_TICKERS = ["SPY", "QQQ", "RSP", "^VIX"]
 YIELD_TICKERS_YF = {
-    "MOVE": "^MOVE",
     "US05Y": "^FVX",
     "US10Y": "^TNX",
     "US30Y": "^TYX",
