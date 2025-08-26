@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+altair
+yfinance
+pandas_datareader
+feedparser
+requests
+beautifulsoup4
+lxml
+scikit-learn
+statsmodels
+matplotlib
