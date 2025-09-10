@@ -1,12 +1,11 @@
 # cross_asset_zscores.py
-# Streamlit Dashboard — Cross-Asset Narrative Z-Score (with Correlations, Headlines & Calendar)
+# Streamlit Dashboard — Cross-Asset Narrative Z-Score (with Correlations, Headlines, Calendar, and Currencies)
 
 from __future__ import annotations
 
 import io
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from itertools import combinations
 from typing import Dict, List
 
 import altair as alt
@@ -26,6 +25,10 @@ def _te_token():
         return sec.get("token") or sec.get("api_key")
     except Exception:
         return None
+    
+def is_fx_pair_name(name: str) -> bool:
+    # FX_PAIRS is your dict like {"EUR/USD": "EURUSD=X", ...}
+    return name in FX_PAIRS
 
 @st.cache_data(show_spinner=False, ttl=300)
 def te_get(path: str, params: dict | None = None) -> list[dict]:
@@ -199,7 +202,19 @@ YIELD_TICKERS_YF = {
     "US10Y": "^TNX",
     "US30Y": "^TYX",
 }
+# Dollar index via Yahoo's ICE futures symbol
 FX_TICKERS = {"DXY": "DX-Y.NYB"}
+
+# FX PAIRS (Yahoo symbols use '=X')
+FX_PAIRS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "EUR/CHF": "EURCHF=X",
+    "AUD/NZD": "AUDNZD=X",
+    "USD/CAD": "USDCAD=X",
+    "USD/JPY": "JPY=X",     # Yahoo uses JPY=X for USD/JPY quote (USD per JPY? Actually JPY=X is USD/JPY)
+}
+
 DEFAULT_LOOKBACK_YEARS = 25
 
 NEWS_PROXY: Dict[str, str] = {
@@ -212,12 +227,14 @@ NEWS_PROXY: Dict[str, str] = {
     "MOVE": "^MOVE",
     "DXY": "UUP",
     "^VIX": "^VIX",
+    # Optionally map FX pairs to ETFs if you want headlines later:
+    # "EUR/USD": "FXE", "GBP/USD": "FXB", "EUR/CHF": "", "AUD/NZD": "FXA", "USD/CAD": "FXC", "USD/JPY": "FXY",
 }
 
 @dataclass
 class AssetSpec:
     name: str
-    source: str  # 'yahoo' (all in this build)
+    source: str  # 'yahoo'
     ticker: str
     kind: str    # 'price' or 'yield'
 
@@ -243,6 +260,12 @@ def build_asset_list() -> List[AssetSpec]:
         assets.append(AssetSpec(name=label, source="yahoo", ticker=yftick, kind="price"))
     return assets
 
+def build_fx_pair_assets() -> List[AssetSpec]:
+    assets: List[AssetSpec] = []
+    for label, yftick in FX_PAIRS.items():
+        assets.append(AssetSpec(name=label, source="yahoo", ticker=yftick, kind="price"))
+    return assets
+
 # =========================================================
 # Robust Yahoo fetch (batch → per-ticker backfill)
 # =========================================================
@@ -256,7 +279,7 @@ def fetch_yahoo_prices(symbols: List[str], start: str) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
 
-    # Batch call
+    # Batch
     try:
         df = yf.download(
             symbols, start=start, interval="1d",
@@ -270,7 +293,6 @@ def fetch_yahoo_prices(symbols: List[str], start: str) -> pd.DataFrame:
     have = set(df.columns) if not df.empty else set()
     missing = [s for s in symbols if s not in have]
 
-    # Per-ticker backfill for dropped symbols (SPY often)
     fills = []
     for s in missing:
         try:
@@ -305,7 +327,14 @@ def load_all_data(assets: List[AssetSpec], start: str) -> Dict[str, pd.Series]:
         if name in ("US05Y", "US10Y", "US30Y"):
             by_name[name] = by_name[name].astype(float) / 10.0
 
+    # >>> NEW: shift FX pairs back one day to align with NY 5pm EOD convention
+    for name in list(by_name.keys()):
+        if is_fx_pair_name(name):
+            by_name[name] = by_name[name].shift(-1)  # move each bar to the previous calendar date
+    # <<<
+
     return by_name
+
 
 @st.cache_data(show_spinner=False)
 def compute_daily_moves(series: pd.Series, kind: str) -> pd.Series:
@@ -455,7 +484,7 @@ def fetch_asset_headlines(asset: str, date_sel: datetime, buffer_days: int = 0, 
     proxy = NEWS_PROXY.get(asset, asset)
     rows = []
 
-    # yfinance news (recent only)
+    # yfinance news
     try:
         t = yf.Ticker(proxy)
         items = t.news or []
@@ -538,6 +567,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ----- Sidebar: global controls -----
 with st.sidebar:
     st.header("Controls")
     theme_choice = st.radio("Theme", ["Dark", "Light"], horizontal=True, index=0)
@@ -599,16 +629,12 @@ with st.sidebar:
         st.experimental_rerun()
 
 asof_ts = pd.Timestamp(sel_date)
-if intraday:
-    snapshot = compute_intraday_snapshot(assets, baseline)
-else:
-    snapshot = compute_snapshot(assets, data, baseline, asof_ts)
-
+snapshot = compute_intraday_snapshot(assets, baseline) if intraday else compute_snapshot(assets, data, baseline, asof_ts)
 moves_wide = build_moves_panel(assets, data)
 
 # Tabs
-TAB_SNAPSHOT, TAB_CORR, TAB_NEWS, TAB_CAL, TAB_EXPLORE, TAB_EXPORT = st.tabs(
-    ["Snapshot", "Correlations", "Headlines", "Calendar", "Explorer", "Exports"]
+TAB_SNAPSHOT, TAB_CORR, TAB_NEWS, TAB_CCY, TAB_CAL, TAB_EXPLORE, TAB_EXPORT = st.tabs(
+    ["Snapshot", "Correlations", "Headlines", "Currencies", "Calendar", "Explorer", "Exports"]
 )
 
 # ---------- Snapshot ----------
@@ -770,6 +796,93 @@ with TAB_NEWS:
                     st.markdown(f"- [{h['title']}]({h['link']})")
                     st.caption(f"{h['publisher']} — {ts} ({src})")
 
+# ---------- Currencies ----------
+with TAB_CCY:
+    st.subheader("FX Pairs — Z-Score Snapshot")
+
+    fx_assets = build_fx_pair_assets()
+    with st.spinner("Loading FX pair data & baselines..."):
+        fx_data = load_all_data(fx_assets, start)
+        fx_baseline = build_baselines(fx_assets, fx_data)
+
+    fx_missing = [a.name for a in fx_assets if a.name not in fx_data]
+    if fx_missing:
+        st.warning("Missing FX data for: " + ", ".join(fx_missing) + ".")
+
+    fx_snapshot = compute_intraday_snapshot(fx_assets, fx_baseline) if intraday else compute_snapshot(fx_assets, fx_data, fx_baseline, pd.Timestamp(sel_date))
+
+    if fx_snapshot.empty:
+        st.info("No FX snapshot available for the selected date.")
+    else:
+        kpi_cols = st.columns(len(fx_snapshot))
+        for i, (_, row) in enumerate(fx_snapshot.iterrows()):
+            mv = f"{row['move']:+.2f}%"  # FX pairs are 'price' so percent
+            kpi_cols[i].metric(label=row["asset"], value=f"Z {row['z']:+.2f}", delta=mv)
+
+        st.divider()
+
+        st.markdown("### Ranked FX Moves (by |Z|)")
+        fx_disp = fx_snapshot[["asset","kind","move","z"]].copy()
+        fx_disp["move"] = fx_disp["move"].map(lambda x: f"{x:+.2f}%")
+        fx_disp["z"] = fx_disp["z"].map(lambda x: f"{x:+.2f}")
+
+        def z_color_ccy(val):
+            try:
+                v = float(val)
+            except Exception:
+                return ""
+            a = min(abs(v)/3, 1.0)
+            return (f"background-color: rgba(0, 200, 0, {a});" if v >= 0
+                    else f"background-color: rgba(200, 0, 0, {a}); color: white;")
+
+        st.dataframe(
+            fx_disp.style.applymap(z_color_ccy, subset=["z"]).hide(axis="index"),
+            use_container_width=True
+        )
+
+        st.markdown("### FX Z-Score Bar Chart")
+        fx_bar = fx_snapshot.copy().sort_values(by="z", key=lambda s: s.abs(), ascending=False)
+        fx_bar["sign"] = np.where(fx_bar["z"] >= 0, "Positive", "Negative")
+        chart = (
+            alt.Chart(fx_bar)
+            .mark_bar()
+            .encode(
+                x=alt.X("z:Q", title="Z-Score"),
+                y=alt.Y("asset:N", sort=list(fx_bar["asset"].values), title="FX Pair"),
+                color=alt.Color("sign:N", legend=None),
+                tooltip=["asset","z","move"]
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        st.markdown("### FX Pair Explorer")
+        sel_fx = st.selectbox("Select FX pair", options=[a.name for a in fx_assets])
+        if sel_fx in fx_data:
+            raw_fx = fx_data[sel_fx].to_frame(name="value").reset_index().rename(columns={"index":"date"})
+            moves_fx = compute_daily_moves(fx_data[sel_fx], "price").to_frame(name="move").reset_index().rename(columns={"index":"date"})
+            stats_fx = fx_baseline.loc[sel_fx]
+            z_moves_fx = moves_fx.copy()
+            z_moves_fx["z"] = (z_moves_fx["move"] - stats_fx["mean"]) / stats_fx["std"] if stats_fx["std"] != 0 else np.nan
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("#### Level")
+                st.altair_chart(
+                    alt.Chart(raw_fx).mark_line().encode(x="date:T", y=alt.Y("value:Q", title="Level")).properties(height=260),
+                    use_container_width=True
+                )
+            with c2:
+                st.markdown("#### Daily Move and Z")
+                st.altair_chart(
+                    alt.Chart(moves_fx).mark_line().encode(x="date:T", y=alt.Y("move:Q", title="Daily Move")).properties(height=130),
+                    use_container_width=True
+                )
+                st.altair_chart(
+                    alt.Chart(z_moves_fx).mark_line().encode(x="date:T", y=alt.Y("z:Q", title="Z-Score")).properties(height=130),
+                    use_container_width=True
+                )
+
 # ---------- Calendar ----------
 with TAB_CAL:
     st.subheader("Economic Calendar (TradingEconomics)")
@@ -810,7 +923,7 @@ with TAB_CAL:
                         return pd.Series({"Asset": r["Asset"], "Pre (prev→event)": fm, "Post (event→next)": fo})
                     st.dataframe(moves_tbl.apply(fmt_row, axis=1), use_container_width=True)
 
-# ---------- Explorer & Exports ----------
+# ---------- Explorer ----------
 with TAB_EXPLORE:
     st.subheader("Time-Series Explorer")
     sel = st.selectbox("Select asset", options=[a.name for a in assets])
@@ -832,6 +945,7 @@ with TAB_EXPLORE:
             st.altair_chart(alt.Chart(moves).mark_line().encode(x="date:T", y=alt.Y("move:Q", title="Daily Move")).properties(height=130), use_container_width=True)
             st.altair_chart(alt.Chart(z_moves).mark_line().encode(x="date:T", y=alt.Y("z:Q", title="Z-Score")).properties(height=130), use_container_width=True)
 
+# ---------- Exports ----------
 with TAB_EXPORT:
     st.subheader("Exports")
     col1, col2 = st.columns(2)
